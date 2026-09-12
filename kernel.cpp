@@ -5,7 +5,7 @@ extern "C" void kernel_main() {
     // 0xB8000 is the memory location where the screen text data begins
     volatile char* video_memory = (volatile char*)0xB8000;
     
-    const char* message = "Hello from your custom OS!";
+    const char* message = "Hello from your custom OS! Made By square-c418";
     int i = 0;
 
     // Loop through the string and output it to screen memory
