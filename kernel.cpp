@@ -1,14 +1,18 @@
-// kernel.cpp - Bare-metal GUI with an Interactive PS/2 Text Mode Mouse Driver
+// kernel.cpp - Interactive OS with a Clickable Mouse GUI Button
 
 const int SCREEN_WIDTH = 80;
 const int SCREEN_HEIGHT = 25;
 volatile char* video_memory = (volatile char*)0xB8000;
 
 // Mouse Tracking Variables
-int mouse_x = 40;  // Start cursor in the middle of the screen
+int mouse_x = 40;  
 int mouse_y = 12;
 unsigned char mouse_cycle = 0;
 char mouse_packet[3];
+bool left_button_pressed = false;
+
+// OS App State
+bool is_app_open = false;
 
 // Draw a single character with specific colors anywhere on screen
 void draw_cell(int x, int y, char c, char color_attribute) {
@@ -56,142 +60,144 @@ void draw_window(int start_x, int start_y, int width, int height, const char* ti
     }
 }
 
-// Basic Hardware I/O Ports assembly wrappers
+// Check if mouse coordinates are inside a bounding box area
+bool is_mouse_hovering(int x, int y, int w, int h) {
+    return (mouse_x >= x && mouse_x < (x + w) && mouse_y >= y && mouse_y < (y + h));
+}
+
+// Main operational rendering sequence loop
+void render_desktop() {
+    // 1. Blue Desktop Wallpaper Base
+    draw_rect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, 0x1F); 
+
+    // 2. Top Header Status Bar
+    draw_rect(0, 0, SCREEN_WIDTH, 1, 0x70);
+    draw_string(2, 0, " Chromebook MouseOS v1.3 ", 0x70);
+
+    // 3. Bottom Taskbar layout panel (Light Gray background 0x70)
+    draw_rect(0, SCREEN_HEIGHT - 1, SCREEN_WIDTH, 1, 0x70);
+    
+    // RENDER BUTTON: [ START ] Button bounds: X=1, Y=24, Width=9, Height=1
+    // Changes to dark green (0x2F) when hovering, otherwise light slate (0x8F)
+    char button_color = is_mouse_hovering(1, SCREEN_HEIGHT - 1, 9, 1) ? 0x2F : 0x8F;
+    draw_rect(1, SCREEN_HEIGHT - 1, 9, 1, button_color);
+    draw_string(2, SCREEN_HEIGHT - 1, "[ START ]", button_color);
+
+    // Dynamic app window logic
+    if (is_app_open) {
+        draw_window(20, 6, 40, 10, "Click App Alpha", 0x4F, 0x4F); // Dark Red panel
+        draw_string(23, 8, "Success! You clicked the button.", 0x4F);
+        draw_string(23, 10, "Click [ START ] again to close.", 0x4F);
+    } else {
+        draw_string(15, 12, "Hover over [ START ] and click to execute.", 0x1E);
+    }
+
+    // RENDER THE MOUSE CURSOR LAST (Flashing white block indicator 'X' 0x0F)
+    draw_cell(mouse_x, mouse_y, 'X', 0x0F); 
+}
+
+// Hardware I/O Ports
 void outb(unsigned short port, unsigned char val) {
     __asm__ volatile("outb %0, %1" : : "a"(val), "Nd"(port));
 }
-
 unsigned char inb(unsigned short port) {
     unsigned char ret;
     __asm__ volatile("inb %1, %0" : "=a"(ret) : "Nd"(port));
     return ret;
 }
 
-// Wait for the PS/2 controller to be ready to accept a command
 void mouse_wait(unsigned char type) {
     unsigned int timeout = 100000;
     if (type == 0) {
-        while (timeout--) {
-            if ((inb(0x64) & 1) == 1) return; // Data is ready to read
-        }
+        while (timeout--) { if ((inb(0x64) & 1) == 1) return; }
     } else {
-        while (timeout--) {
-            if ((inb(0x64) & 2) == 0) return; // Ready for a write command
-        }
+        while (timeout--) { if ((inb(0x64) & 2) == 0) return; }
     }
 }
 
-// Write data directly to the mouse device inside the PS/2 controller
 void mouse_write(unsigned char a_write) {
-    mouse_wait(1);
-    outb(0x64, 0xD4); // Tell controller to route next byte straight to the mouse
-    mouse_wait(1);
-    outb(0x60, a_write);
+    mouse_wait(1); outb(0x64, 0xD4);
+    mouse_wait(1); outb(0x60, a_write);
 }
 
-// Initialize and wake up the PS/2 Mouse hardware interface
 void init_mouse() {
     unsigned char status;
-
-    mouse_wait(1);
-    outb(0x64, 0xA8); // Enable auxiliary mouse device port
-
-    mouse_wait(1);
-    outb(0x64, 0x20); // Command: Read current controller status byte
-    mouse_wait(0);
-    status = (inb(0x60) | 2); // Modify status to enable mouse interrupts
-
-    mouse_wait(1);
-    outb(0x64, 0x60); // Command: Write updated controller status byte
-    mouse_wait(1);
-    outb(0x60, status);
-
-    mouse_write(0xF6); // Command: Tell mouse to load default configuration settings
-    inb(0x60);         // Read acknowledgment byte back from mouse hardware
-
-    mouse_write(0xF4); // Command: Enable packet streaming (mouse turns on!)
-    inb(0x60);         // Read final acknowledgment byte
+    mouse_wait(1); outb(0x64, 0xA8);
+    mouse_wait(1); outb(0x64, 0x20);
+    mouse_wait(0); status = (inb(0x60) | 2);
+    mouse_wait(1); outb(0x64, 0x60);
+    mouse_wait(1); outb(0x60, status);
+    mouse_write(0xF6); inb(0x60);
+    mouse_write(0xF4); inb(0x60);
 }
 
-// Poll the mouse hardware port to see if a movement packet has arrived
+// Scrape hardware port packets and check button clicks
 void process_mouse_input() {
-    // Check if the data bit on port 0x64 is active
     if ((inb(0x64) & 1) == 1) {
         unsigned char data = inb(0x60);
         
-        // Step through the 3-byte mouse protocol packet
         if (mouse_cycle == 0) {
-            if ((data & 0x08) == 0x08) { // Bit 3 must always be 1 for a valid 1st packet byte
+            if ((data & 0x08) == 0x08) { 
                 mouse_packet[0] = data;
                 mouse_cycle = 1;
             }
         } else if (mouse_cycle == 1) {
-            mouse_packet[1] = data; // X-axis movement relative delta byte
+            mouse_packet[1] = data; 
             mouse_cycle = 2;
         } else if (mouse_cycle == 2) {
-            mouse_packet[2] = data; // Y-axis movement relative delta byte
+            mouse_packet[2] = data; 
             mouse_cycle = 0;
 
-            // Handle horizontal X relative movement tracking
+            // Check if Left Mouse Button is actively down (Bit 0 of packet 0)
+            bool clicked = (mouse_packet[0] & 0x01);
+
+            // Handle horizontal and vertical movement math
             int move_x = (int)mouse_packet[1];
-            if (mouse_packet[0] & 0x10) move_x |= 0xFFFFFF00; // Sign-extend negative movement value
-            
-            // Handle vertical Y relative movement tracking (PS/2 Y axis inverted)
+            if (mouse_packet[0] & 0x10) move_x |= 0xFFFFFF00;
             int move_y = (int)mouse_packet[2];
             if (mouse_packet[0] & 0x20) move_y |= 0xFFFFFF00;
 
-            // Update mouse coordinates (divide movement scale to keep mouse speed smooth)
             mouse_x += (move_x / 2);
             mouse_y -= (move_y / 2);
 
-            // Force screen layout constraints boundary clipping
+            // Bounds boundary clipping
             if (mouse_x < 0) mouse_x = 0;
             if (mouse_x >= SCREEN_WIDTH) mouse_x = SCREEN_WIDTH - 1;
             if (mouse_y < 0) mouse_y = 0;
             if (mouse_y >= SCREEN_HEIGHT) mouse_y = SCREEN_HEIGHT - 1;
+
+            // Trigger click action on button press state transition
+            if (clicked && !left_button_pressed) {
+                left_button_pressed = true;
+
+                // BUTTON CLICK INTERSECTION TARGET
+                // Check if cursor location overlaps the bounds of the [ START ] layout
+                if (is_mouse_hovering(1, SCREEN_HEIGHT - 1, 9, 1)) {
+                    is_app_open = !is_app_open; // Open or close window block
+                }
+            } else if (!clicked) {
+                left_button_pressed = false; // Reset toggle flag when releasing trackpad
+            }
         }
     }
 }
 
-// Main operational rendering sequence loop
-void render_desktop() {
-    // Desktop canvas base
-    draw_rect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, 0x1F); // Blue Desktop Wallpaper
-
-    // Header Status Bar Layout
-    draw_rect(0, 0, SCREEN_WIDTH, 1, 0x70);
-    draw_string(2, 0, " Chromebook MouseOS v1.2 ", 0x70);
-
-    // Decorative static desk app component frame
-    draw_window(15, 6, 50, 10, "Mouse System Status Window", 0x1E, 0x1E);
-    draw_string(18, 8, "Move trackpad/mouse to translate cursor block.", 0x1E);
-    draw_string(18, 10, "-> Active Driver: Core PS/2 Pointer Pipeline", 0x1E);
-    draw_string(18, 12, "-> Mode Type    : TUI Coordinate Layer", 0x1E);
-
-    // Dynamic Tracking Coordinate Debug Readout String
-    draw_string(2, SCREEN_HEIGHT - 1, "Trackpad X/Y Address Block Locator: ", 0x1F);
-    
-    // RENDER THE MOUSE POINTER LAST (Draws an inverse flashing magenta visual marker block 'X')
-    draw_cell(mouse_x, mouse_y, 'X', 0x5F); 
-}
-
 extern "C" void kernel_main() {
-    init_mouse();       // Fire up mouse interface hardware
-    render_desktop();   // Initialize base desktop canvas frame layout
+    init_mouse();       
+    render_desktop();   
 
-    // Operational Core Main Dynamic Execution Loop
     while (1) {
         int old_x = mouse_x;
         int old_y = mouse_y;
+        bool old_app_state = is_app_open;
 
-        process_mouse_input(); // Continually scrape hardware packets
+        process_mouse_input(); 
 
-        // If the mouse variables changed, redraft frame update to trace movements smoothly
-        if (mouse_x != old_x || mouse_y != old_y) {
+        // Rerender desktop frame if location changes or button gets triggered
+        if (mouse_x != old_x || mouse_y != old_y || is_app_open != old_app_state) {
             render_desktop();
         }
 
-        // Minor core breathing gap performance cycle delay trace
-        for (volatile int i = 0; i < 5000; i++);
+        for (volatile int i = 0; i < 4000; i++);
     }
 }
